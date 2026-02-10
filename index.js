@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
-import line from '@line/bot-sdk';
+import * as line from '@line/bot-sdk';
 import OpenAI from 'openai';
 import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
