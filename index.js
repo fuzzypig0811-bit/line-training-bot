@@ -106,11 +106,30 @@ app.get('/files/:id', async (req, res) => {
 });
 
 // LINE webhook（middleware 會驗 signature；secret/token 錯會直接擋）
-app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
+// ✅ 讓你用瀏覽器確認路徑（GET 不影響 LINE）
+app.get('/webhook', (_, res) => res.status(200).send('webhook ok'));
+
+// ✅ 用「可捕捉錯誤」的方式包 LINE middleware，避免它丟錯變 500
+const lineMiddleware = (req, res, next) => {
+  const mw = line.middleware(lineConfig);
+  mw(req, res, (err) => {
+    if (!err) return next();
+
+    // 把真正原因印出來（你按 Verify 時，Railway logs 會出現這段）
+    console.error('[LINE middleware error]', err);
+
+    // 常見：Channel secret 不對 → signature 驗證失敗
+    // 常見：不是 LINE 平台打來 → 缺 X-Line-Signature
+    // 我們不要回 500，改回 401 讓你一眼看懂是驗證問題
+    return res.status(401).send('Invalid LINE signature / middleware error');
+  });
+};
+
+app.post('/webhook', lineMiddleware, async (req, res) => {
   try {
     const events = req.body?.events || [];
 
-    // ✅ LINE Verify 很常送 events: []，直接回 200 才會通過
+    // ✅ LINE Verify 可能送 events: []，這時必須回 200
     if (!Array.isArray(events) || events.length === 0) {
       return res.status(200).end();
     }
@@ -118,10 +137,12 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     await Promise.all(events.map(handleEvent));
     return res.status(200).end();
   } catch (err) {
-    console.error('[WEBHOOK] error:', err);
-    return res.status(500).end();
+    console.error('[WEBHOOK handler error]', err);
+    // 不要讓 Verify 看到 500（會失敗），先回 200，錯誤留在 logs
+    return res.status(200).end();
   }
 });
+
 
 // -------------------- HANDLERS --------------------
 
