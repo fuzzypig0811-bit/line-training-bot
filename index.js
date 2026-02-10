@@ -8,21 +8,50 @@ import { Document, Packer, Paragraph, TextRun } from 'docx';
 
 const app = express();
 
-// ---- LINE ----
+// -------------------- ENV GUARD --------------------
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v || String(v).trim() === '') {
+    console.error(`[ENV] Missing: ${name}`);
+    return null;
+  }
+  return v;
+}
+
+// LINE env
+const LINE_CHANNEL_ACCESS_TOKEN = mustEnv('LINE_CHANNEL_ACCESS_TOKEN');
+const LINE_CHANNEL_SECRET = mustEnv('LINE_CHANNEL_SECRET');
+
+// OpenAI env
+const OPENAI_API_KEY = mustEnv('OPENAI_API_KEY');
+
+// DB env
+const DATABASE_URL = mustEnv('DATABASE_URL');
+
+// Base URL for file links
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ''; // 可先不設，後續再補
+
+// -------------------- LINE CLIENT --------------------
 const lineConfig = {
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
+  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN || 'MISSING_TOKEN',
+  channelSecret: LINE_CHANNEL_SECRET || 'MISSING_SECRET',
 };
-const lineClient = new line.Client(lineConfig);
 
-// ---- OpenAI ----
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const lineClient = new line.Client({
+  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN || 'MISSING_TOKEN',
+});
 
-// ---- Postgres ----
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+// -------------------- OPENAI --------------------
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY || 'MISSING_OPENAI_KEY' });
 
-// 初始化資料表（最少步驟：開機自動建表）
+// -------------------- POSTGRES --------------------
+const pool = DATABASE_URL ? new pg.Pool({ connectionString: DATABASE_URL }) : null;
+
 async function initDb() {
+  if (!pool) {
+    console.error('[DB] DATABASE_URL missing, skip initDb');
+    return;
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS messages (
       id UUID PRIMARY KEY,
@@ -42,132 +71,205 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  console.log('[DB] initDb OK');
 }
-await initDb();
 
-// 健康檢查
+// 不要讓 DB 啟動失敗造成整個 app crash → 避免 502
+initDb().catch((err) => console.error('[DB] initDb failed:', err));
+
+// -------------------- ROUTES --------------------
+
+// Health check
 app.get('/', (_, res) => res.status(200).send('OK'));
 
-// 下載檔案（回傳連結最穩：用你的服務域名提供）
-app.get('/files/:id', async (req, res) => {
-  const { id } = req.params;
-  const r = await pool.query('SELECT filename, mime, data FROM files WHERE id=$1', [id]);
-  if (r.rowCount === 0) return res.status(404).send('Not found');
-  const f = r.rows[0];
-  res.setHeader('Content-Type', f.mime);
-  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(f.filename)}`);
-  res.status(200).send(f.data);
-});
+// 讓你用瀏覽器確認 webhook 路徑是否正確（LINE Verify 走 POST，不會走這個）
+app.get('/webhook', (_, res) => res.status(200).send('webhook ok'));
 
-// LINE webhook
-app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
+// 檔案下載連結（回傳 Word）
+app.get('/files/:id', async (req, res) => {
   try {
-    const events = req.body.events || [];
-    await Promise.all(events.map(handleEvent));
-    res.status(200).end(); // LINE 需要 200 才算成功 :contentReference[oaicite:10]{index=10}
-  } catch (e) {
-    console.error(e);
-    res.status(500).end();
+    if (!pool) return res.status(500).send('DB not configured');
+    const { id } = req.params;
+    const r = await pool.query('SELECT filename, mime, data FROM files WHERE id=$1', [id]);
+    if (r.rowCount === 0) return res.status(404).send('Not found');
+    const f = r.rows[0];
+    res.setHeader('Content-Type', f.mime);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(f.filename)}`
+    );
+    return res.status(200).send(f.data);
+  } catch (err) {
+    console.error('[FILES] error:', err);
+    return res.status(500).send('Internal Error');
   }
 });
 
+// LINE webhook（middleware 會驗 signature；secret/token 錯會直接擋）
+app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
+  try {
+    const events = req.body?.events || [];
+
+    // ✅ LINE Verify 很常送 events: []，直接回 200 才會通過
+    if (!Array.isArray(events) || events.length === 0) {
+      return res.status(200).end();
+    }
+
+    await Promise.all(events.map(handleEvent));
+    return res.status(200).end();
+  } catch (err) {
+    console.error('[WEBHOOK] error:', err);
+    return res.status(500).end();
+  }
+});
+
+// -------------------- HANDLERS --------------------
+
 async function handleEvent(event) {
+  // 只處理文字訊息
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
-  const userText = event.message.text.trim();
+  const userText = String(event.message.text || '').trim();
   const userId = event.source?.userId || 'unknown';
 
+  // 若 LINE token/secret 沒設好，直接回覆可讀訊息（避免 crash）
+  if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
+    await safeReply(event.replyToken, 'LINE token/secret 尚未設定完成，請先在 Railway Variables 設定。');
+    return;
+  }
+  if (!OPENAI_API_KEY) {
+    await safeReply(event.replyToken, 'OPENAI_API_KEY 尚未設定完成，請先在 Railway Variables 設定。');
+    return;
+  }
+
   // 1) 存使用者訊息
-  await pool.query(
-    'INSERT INTO messages (id, user_id, role, content) VALUES ($1,$2,$3,$4)',
-    [uuidv4(), userId, 'user', userText]
-  );
+  if (pool) {
+    await pool.query(
+      'INSERT INTO messages (id, user_id, role, content) VALUES ($1,$2,$3,$4)',
+      [uuidv4(), userId, 'user', userText]
+    );
+  }
 
-  // 2) 取最近 20 則對話（做「記憶」）
-  const hist = await pool.query(
-    `SELECT role, content FROM messages
-     WHERE user_id=$1
-     ORDER BY created_at DESC
-     LIMIT 20`,
-    [userId]
-  );
+  // 2) 取最近 20 則對話（記憶）
+  let history = [];
+  if (pool) {
+    const hist = await pool.query(
+      `SELECT role, content FROM messages
+       WHERE user_id=$1
+       ORDER BY created_at DESC
+       LIMIT 20`,
+      [userId]
+    );
+    history = hist.rows.reverse().map((r) => ({ role: r.role, content: r.content }));
+  } else {
+    history = [{ role: 'user', content: userText }];
+  }
 
-  const history = hist.rows.reverse().map(r => ({ role: r.role, content: r.content }));
-
-  // 3) 系統提示：把你的訓練規則寫死在這裡（之後可改成 DB 可編輯）
   const systemPrompt = `
 你是我的訓練教練助理，用繁體中文。
 我回報訓練（跑步/重訓/游泳/登山/瑜珈）時：
 - 回覆：重點摘要、風險提醒、明日建議（清楚表列）
-- 若內容足夠，補充：PRE×心率×配速判讀（含降載規則）
-- 若提到疼痛/不適，先做風險分級與保守建議
-如果我說「產出報告」或「做成Word」，請產出一份可下載的 Word 報告（以條列＋表格概念呈現）。
+- 若避免受傷更重要，請保守建議
+若我說「產出報告」或「做成Word」，請產出一份可下載 Word 報告（條列清楚）。
 `;
 
-  // 4) 送到 OpenAI Responses API :contentReference[oaicite:11]{index=11}
+  // 3) OpenAI 回覆
   const resp = await openai.responses.create({
     model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
     input: [
       { role: 'system', content: systemPrompt },
-      ...history.map(m => ({ role: m.role, content: m.content }))
+      ...history.map((m) => ({ role: m.role, content: m.content })),
     ],
   });
 
   const replyText = resp.output_text || '我剛剛沒有產生到回覆，請再傳一次～';
 
-  // 5) 若需要產 Word（你也可以改成：只要偵測到訓練回報就自動產）
-  const shouldMakeWord =
-    /word|報告|整理成檔|完整分析|週彙總|月彙總/i.test(userText);
+  // 4) 需要產 Word 的判斷
+  const shouldMakeWord = /word|報告|整理成檔|完整分析|週彙總|月彙總/i.test(userText);
 
   if (shouldMakeWord) {
+    if (!pool) {
+      await safeReply(event.replyToken, replyText + '\n\n（DB 未設定，暫時無法產 Word）');
+      return;
+    }
     const fileId = await makeWordAndSave(userId, replyText);
-    const baseUrl = process.env.PUBLIC_BASE_URL; // Railway 提供的網域，部署後填入
-    const link = `${baseUrl}/files/${fileId}`;
+
+    // PUBLIC_BASE_URL 若未設，就回提示（不讓流程 crash）
+    const baseUrl = (PUBLIC_BASE_URL || '').trim();
+    if (!baseUrl) {
+      const finalText =
+        replyText +
+        `\n\n📄 Word 已生成，但 PUBLIC_BASE_URL 尚未設定。\n請在 Railway Variables 設定 PUBLIC_BASE_URL = 你的公開網址（https://xxx.up.railway.app）\n檔案ID：${fileId}`;
+      await storeAssistantMessage(userId, finalText);
+      await safeReply(event.replyToken, finalText);
+      return;
+    }
+
+    const link = `${baseUrl.replace(/\/$/, '')}/files/${fileId}`;
     const finalText = `${replyText}\n\n📄 Word 下載連結：\n${link}`;
 
-    await pool.query(
-      'INSERT INTO messages (id, user_id, role, content) VALUES ($1,$2,$3,$4)',
-      [uuidv4(), userId, 'assistant', finalText]
-    );
-
-    await lineClient.replyMessage(event.replyToken, { type: 'text', text: finalText });
+    await storeAssistantMessage(userId, finalText);
+    await safeReply(event.replyToken, finalText);
     return;
   }
 
-  // 6) 正常回覆
-  await pool.query(
-    'INSERT INTO messages (id, user_id, role, content) VALUES ($1,$2,$3,$4)',
-    [uuidv4(), userId, 'assistant', replyText]
-  );
-
-  await lineClient.replyMessage(event.replyToken, { type: 'text', text: replyText });
+  // 一般回覆
+  await storeAssistantMessage(userId, replyText);
+  await safeReply(event.replyToken, replyText);
 }
 
-// 產 docx → 存 DB → 回傳 fileId
+async function storeAssistantMessage(userId, content) {
+  if (!pool) return;
+  await pool.query(
+    'INSERT INTO messages (id, user_id, role, content) VALUES ($1,$2,$3,$4)',
+    [uuidv4(), userId, 'assistant', content]
+  );
+}
+
+async function safeReply(replyToken, text) {
+  try {
+    if (!replyToken) return;
+    await lineClient.replyMessage(replyToken, { type: 'text', text: String(text).slice(0, 4900) });
+  } catch (err) {
+    console.error('[LINE] reply error:', err);
+  }
+}
+
+// 產 docx → 存 DB → 回 fileId
 async function makeWordAndSave(userId, text) {
   const doc = new Document({
-    sections: [{
-      children: [
-        new Paragraph({
-          children: [new TextRun({ text: '訓練分析報告', bold: true })]
-        }),
-        new Paragraph(''),
-        ...text.split('\n').map(line => new Paragraph(line))
-      ]
-    }]
+    sections: [
+      {
+        children: [
+          new Paragraph({
+            children: [new TextRun({ text: '訓練分析報告', bold: true })],
+          }),
+          new Paragraph(''),
+          ...String(text)
+            .split('\n')
+            .map((line) => new Paragraph(line)),
+        ],
+      },
+    ],
   });
 
   const buf = await Packer.toBuffer(doc);
   const fileId = uuidv4();
-  const filename = `report_${new Date().toISOString().slice(0,10)}.docx`;
+  const filename = `report_${new Date().toISOString().slice(0, 10)}.docx`;
 
   await pool.query(
     'INSERT INTO files (id, user_id, filename, mime, data) VALUES ($1,$2,$3,$4,$5)',
-    [fileId, userId, filename, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', buf]
+    [
+      fileId,
+      userId,
+      filename,
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      buf,
+    ]
   );
-
   return fileId;
 }
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Listening on :${port}`));
+// -------------------- START SERVER --------------------
+const port = Number(process.env.PORT || 3000);
+app.listen(port, '0.0.0.0', () => console.log(`Listening on :${port}`));
